@@ -271,7 +271,6 @@ def type_text(text):
     if not text:
         return
     klass = get_active_window_class().lower()
-    time.sleep(0.15)
 
     if "wave" in klass:
         # Wave Terminal (XWayland Electron): xterm.js drops first chars from
