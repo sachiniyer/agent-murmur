@@ -288,6 +288,7 @@ def record_until_signal():
 
     audio = np.concatenate(chunks, axis=0)
     audio = normalize_audio(audio)
+    audio = trim_silence(audio)
     fd, wav_path = tempfile.mkstemp(prefix="dictation-", suffix=".wav")
     os.close(fd)
     with wave.open(wav_path, "wb") as wf:
@@ -296,6 +297,32 @@ def record_until_signal():
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio.tobytes())
     return wav_path
+
+
+def trim_silence(audio, frame_ms=20, threshold_rms=120, padding_ms=100):
+    """Trim leading/trailing silence. Reduces hallucinations on padded audio.
+
+    Frame into ~20ms windows, RMS each, slice between the first/last frames
+    above threshold with a small padding so speech onset/offset isn't cut.
+    Run AFTER normalize_audio so the speech/silence boundary is clear.
+    """
+    import numpy as np
+
+    if audio.size == 0:
+        return audio
+    samples_per_frame = SAMPLE_RATE * frame_ms // 1000
+    if samples_per_frame <= 0 or audio.size < samples_per_frame:
+        return audio
+    n_frames = audio.size // samples_per_frame
+    framed = audio[: n_frames * samples_per_frame].reshape(n_frames, samples_per_frame)
+    rms = np.sqrt(np.mean(framed.astype(np.int64) ** 2, axis=1))
+    above = np.where(rms > threshold_rms)[0]
+    if above.size == 0:
+        return audio
+    pad_frames = padding_ms // frame_ms
+    start_frame = max(0, above[0] - pad_frames)
+    end_frame = min(n_frames, above[-1] + 1 + pad_frames)
+    return audio[start_frame * samples_per_frame : end_frame * samples_per_frame]
 
 
 def normalize_audio(audio):
