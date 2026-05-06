@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Toggle push-to-talk dictation. Records audio, transcribes via Groq Whisper,
-optionally cleans the text via Groq Llama 4 Scout, and types it into the
-focused window.
+cleans the text via Groq Llama 4 Scout, and types it into the focused window.
 
 First invocation starts recording. Second invocation stops, transcribes, and
 types the result.
@@ -214,7 +213,7 @@ def transcribe(wav_path):
 
 
 def clean_transcript(text):
-    """Optional Llama 4 Scout cleanup pass. Returns cleaned text, or raw on failure."""
+    """Llama 4 Scout cleanup pass. Returns cleaned text, or the raw input on failure."""
     if len(text) < 10:
         return text
     messages = [{"role": "system", "content": CLEANUP_SYSTEM_PROMPT}]
@@ -229,8 +228,7 @@ def clean_transcript(text):
             temperature=0.0, max_tokens=2000,
         )
         return (response.choices[0].message.content or "").strip() or text
-    except Exception as e:
-        sys.stderr.write(f"cleanup failed: {e}\n")
+    except Exception:
         return text
 
 
