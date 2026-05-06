@@ -5,8 +5,10 @@ Push-to-talk dictation for Linux. Powered by Groq's Whisper API.
 ## Features
 
 - **Toggle hotkey** — tap to start, tap again to stop
-- **Audio normalization** — boosts quiet recordings (whispers) to Whisper's expected level
+- **Audio normalization + silence trim** — boosts quiet recordings (whispers) to Whisper's expected level and strips leading/trailing silence
+- **AI cleanup pass** — Llama 4 Scout removes filler words and self-corrections after Whisper transcribes
 - **Per-window typing** — `xdotool` for Wave Terminal, `wl-copy` + Ctrl+Shift+V for other terminals, `ydotool` everywhere else
+- **Session logging** — every transcript pair (raw + cleaned) plus the audio is saved to `~/.local/share/dictation/sessions/` for later analysis
 - **Notifications + audio cues** on start/stop
 
 ## Install

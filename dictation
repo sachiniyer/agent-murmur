@@ -14,6 +14,8 @@ VENV_PYTHON = Path.home() / ".local/share/dictation/venv/bin/python3"
 if sys.executable != str(VENV_PYTHON) and VENV_PYTHON.exists():
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
+import json
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -30,6 +32,9 @@ from groq import Groq
 
 LOCK_PATH = Path("/tmp/dictation.lock")
 CONFIG_PATH = Path.home() / ".config/dictation/config"
+SESSIONS_DIR = Path.home() / ".local/share/dictation/sessions"
+SESSIONS_LOG = SESSIONS_DIR / "sessions.jsonl"
+SESSIONS_AUDIO = SESSIONS_DIR / "audio"
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -280,6 +285,27 @@ def type_text(text):
 
 # ----- orchestration -------------------------------------------------------
 
+def save_session(audio_path, raw_text, clean_text):
+    """Move the WAV into ~/.local/share/dictation/sessions/audio/ and append a
+    JSONL row capturing the raw + cleaned transcripts. Returns True on success."""
+    try:
+        SESSIONS_AUDIO.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%S")
+        wav_name = f"{ts}.wav"
+        shutil.move(str(audio_path), str(SESSIONS_AUDIO / wav_name))
+        record = {
+            "timestamp": ts,
+            "audio": f"audio/{wav_name}",
+            "raw": raw_text,
+            "clean": clean_text,
+        }
+        with SESSIONS_LOG.open("a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
 def run_recording_session():
     acquire_lock()
     notify("Recording…", "Tap shortcut again to stop", expire_ms=1500)
@@ -293,17 +319,20 @@ def run_recording_session():
         beep(660)
 
         try:
-            text = transcribe(wav_path)
+            raw_text = transcribe(wav_path)
         except Exception as e:
             notify("Transcription failed", str(e)[:200], urgency="critical")
             return
-        if not text:
+        if not raw_text:
             notify("Empty transcript", "(no text returned)")
             return
 
-        text = clean_transcript(text)
-        type_text(text)
-        preview = text if len(text) <= 120 else text[:117] + "…"
+        clean_text = clean_transcript(raw_text)
+        type_text(clean_text)
+        if save_session(wav_path, raw_text, clean_text):
+            wav_path = None  # save_session moved the file; don't unlink in finally
+
+        preview = clean_text if len(clean_text) <= 120 else clean_text[:117] + "…"
         notify("Transcribed", preview)
     finally:
         if wav_path and os.path.exists(wav_path):
