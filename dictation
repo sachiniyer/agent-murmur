@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Toggle push-to-talk dictation: record audio, transcribe, type the result.
+
+First invocation starts recording. Second invocation stops, transcribes, and
+types the transcript into the focused window via ydotool.
+"""
+
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import wave
+from pathlib import Path
+
+LOCK_PATH = Path("/tmp/dictation.lock")
+CONFIG_PATH = Path.home() / ".config/dictation/config"
+VENV_PYTHON = Path.home() / ".local/share/dictation/venv/bin/python3"
+SAMPLE_RATE = 16000
+CHANNELS = 1
+NOTIFY_APP = "Dictation"
+
+
+def reexec_in_venv():
+    if sys.executable != str(VENV_PYTHON) and VENV_PYTHON.exists():
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        notify("Config missing", f"Create {CONFIG_PATH}")
+        sys.exit(1)
+    for line in CONFIG_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
+def notify(title, body="", expire_ms=2500, urgency="normal"):
+    try:
+        subprocess.run(
+            [
+                "notify-send",
+                "-a", NOTIFY_APP,
+                "-u", urgency,
+                "-t", str(expire_ms),
+                title,
+                body,
+            ],
+            check=False,
+        )
+    except FileNotFoundError:
+        pass
+
+
+def beep(freq):
+    try:
+        subprocess.Popen(
+            ["sox", "-n", "-q", "-d", "synth", "0.08", "sine", str(freq), "vol", "0.3"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
+def read_lock():
+    try:
+        pid = int(LOCK_PATH.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        LOCK_PATH.unlink(missing_ok=True)
+        return None
+    except PermissionError:
+        return pid
+    return pid
+
+
+def stop_other(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        LOCK_PATH.unlink(missing_ok=True)
+
+
+def acquire_lock():
+    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def release_lock():
+    LOCK_PATH.unlink(missing_ok=True)
+
+
+TERMINAL_PATTERNS = (
+    "wave", "konsole", "alacritty", "kitty", "ghostty",
+    "xterm", "wezterm", "gnome-terminal", "tilix", "foot",
+)
+
+
+def get_active_window_class():
+    """Return the WM_CLASS string of the focused window, or None."""
+    try:
+        wid = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if wid.returncode != 0 or not wid.stdout.strip():
+            return None
+        prop = subprocess.run(
+            ["xprop", "-id", wid.stdout.strip(), "WM_CLASS"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if prop.returncode != 0:
+            return None
+        return prop.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def is_terminal_window(class_str):
+    if not class_str:
+        return False
+    s = class_str.lower()
+    return any(p in s for p in TERMINAL_PATTERNS)
+
+
+def paste_via_clipboard(text, env):
+    """Stash current clipboard, copy `text`, send Ctrl+Shift+V, then restore."""
+    try:
+        prev = subprocess.run(
+            ["wl-paste", "-n"], capture_output=True, timeout=2,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        prev = None
+
+    p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+    p.communicate(input=text.encode())
+
+    time.sleep(0.1)
+    subprocess.run(["ydotool", "key", "ctrl+shift+v"], env=env, check=False)
+
+    if prev is not None:
+        time.sleep(0.5)
+        p2 = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+        p2.communicate(input=prev)
+
+
+def type_text(text):
+    if not text:
+        return
+    socket_path = os.environ.get("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
+    env = {**os.environ, "YDOTOOL_SOCKET": socket_path}
+    klass = get_active_window_class()
+    klass_lower = klass.lower() if klass else ""
+
+    time.sleep(0.15)
+
+    if "wave" in klass_lower:
+        # Wave Terminal: xterm.js drops first chars from ydotool; xdotool type via
+        # XWayland avoids that and Wave's broken Ctrl+Shift+V paste shortcut.
+        subprocess.run(
+            ["xdotool", "type", "--delay", "4", "--", text],
+            check=False,
+        )
+        return
+
+    if is_terminal_window(klass):
+        paste_via_clipboard(text, env)
+        return
+
+    subprocess.run(
+        ["ydotool", "type", "--key-delay=4", "--", text],
+        env=env,
+        check=False,
+    )
+
+
+def transcribe(wav_path):
+    from groq import Groq
+
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    with open(wav_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            file=(os.path.basename(wav_path), f, "audio/wav"),
+            model="whisper-large-v3-turbo",
+            language="en",
+            temperature=0.0,
+        )
+    return result.text.strip()
+
+
+def record_until_signal():
+    """Record audio until SIGTERM. Return path to a temp WAV file."""
+    import numpy as np
+    import sounddevice as sd
+
+    chunks = []
+    stop_event = threading.Event()
+
+    def on_signal(_signum, _frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    def callback(indata, _frames, _time, status):
+        if status:
+            sys.stderr.write(f"audio status: {status}\n")
+        chunks.append(indata.copy())
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+        callback=callback,
+    ):
+        stop_event.wait()
+
+    if not chunks:
+        return None
+
+    audio = np.concatenate(chunks, axis=0)
+    audio = normalize_audio(audio)
+    fd, wav_path = tempfile.mkstemp(prefix="dictation-", suffix=".wav")
+    os.close(fd)
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
+    return wav_path
+
+
+def normalize_audio(audio):
+    """Boost quiet recordings (whispers) to Whisper's expected level.
+
+    Uses 99th-percentile peak normalization: scales so the loudest 1% of samples
+    sit near -3 dBFS. Ignores transient spikes (clicks, breaths) and skips
+    near-silent inputs to avoid amplifying noise.
+    """
+    import numpy as np
+
+    abs_audio = np.abs(audio.astype(np.int32))
+    if abs_audio.size == 0:
+        return audio
+    p99 = float(np.percentile(abs_audio, 99))
+    if p99 < 50:
+        return audio
+    target_peak = 23000  # ~-3 dBFS, headroom below int16 max
+    gain = min(target_peak / p99, 40.0)
+    if gain <= 1.2:
+        return audio
+    normalized = audio.astype(np.float32) * gain
+    return np.clip(normalized, -32768, 32767).astype(np.int16)
+
+
+def run_recording_session():
+    acquire_lock()
+    notify("Recording…", "Tap shortcut again to stop", expire_ms=1500)
+    beep(880)
+    wav_path = None
+    try:
+        wav_path = record_until_signal()
+        if not wav_path:
+            notify("No audio captured", "", urgency="critical")
+            return
+        beep(660)
+        try:
+            text = transcribe(wav_path)
+        except Exception as e:
+            notify("Transcription failed", str(e)[:200], urgency="critical")
+            return
+        if not text:
+            notify("Empty transcript", "(no text returned)")
+            return
+        type_text(text)
+        preview = text if len(text) <= 120 else text[:117] + "…"
+        notify("Transcribed", preview)
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            os.unlink(wav_path)
+        release_lock()
+
+
+def main():
+    reexec_in_venv()
+    load_config()
+    if not os.environ.get("GROQ_API_KEY") or os.environ["GROQ_API_KEY"].startswith("PASTE_"):
+        notify("API key not set", f"Edit {CONFIG_PATH}", urgency="critical")
+        sys.exit(1)
+
+    other = read_lock()
+    if other is not None:
+        stop_other(other)
+        return
+    run_recording_session()
+
+
+if __name__ == "__main__":
+    main()
