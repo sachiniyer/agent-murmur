@@ -30,7 +30,6 @@ from groq import Groq
 
 LOCK_PATH = Path("/tmp/dictation.lock")
 CONFIG_PATH = Path.home() / ".config/dictation/config"
-TIMING_LOG = Path("/tmp/dictation-timing.log")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -281,15 +280,6 @@ def type_text(text):
 
 # ----- orchestration -------------------------------------------------------
 
-def log_timing(transcribe_ms, cleanup_ms, chars):
-    try:
-        with TIMING_LOG.open("a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
-                    f"transcribe={transcribe_ms:.0f}ms cleanup={cleanup_ms:.0f}ms chars={chars}\n")
-    except OSError:
-        pass
-
-
 def run_recording_session():
     acquire_lock()
     notify("Recording…", "Tap shortcut again to stop", expire_ms=1500)
@@ -303,9 +293,7 @@ def run_recording_session():
         beep(660)
 
         try:
-            t0 = time.perf_counter()
             text = transcribe(wav_path)
-            transcribe_ms = (time.perf_counter() - t0) * 1000
         except Exception as e:
             notify("Transcription failed", str(e)[:200], urgency="critical")
             return
@@ -313,11 +301,7 @@ def run_recording_session():
             notify("Empty transcript", "(no text returned)")
             return
 
-        t1 = time.perf_counter()
         text = clean_transcript(text)
-        cleanup_ms = (time.perf_counter() - t1) * 1000
-
-        log_timing(transcribe_ms, cleanup_ms, len(text))
         type_text(text)
         preview = text if len(text) <= 120 else text[:117] + "…"
         notify("Transcribed", preview)
