@@ -4,41 +4,152 @@ cleans the text via Groq Llama 4 Scout, and types it into the focused window.
 
 First invocation starts recording. Second invocation stops, transcribes, and
 types the result.
+
+This file is structured so the audio stream opens as soon as possible after
+the hotkey fires — heavy imports happen *after* capture has started so the
+user's first words aren't lost.
 """
 
+# ----- Phase 1: stdlib only — fast stop path + venv reexec -----------------
+
 import os
+import signal
 import sys
 from pathlib import Path
 
+LOCK_PATH = Path("/tmp/dictation.lock")
 VENV_PYTHON = Path.home() / ".local/share/dictation/venv/bin/python3"
+
+
+def _try_stop_running():
+    """If a session is already running, send it SIGTERM. Returns True if so."""
+    try:
+        pid = int(LOCK_PATH.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        LOCK_PATH.unlink(missing_ok=True)
+        return False
+
+
+# Fast stop path: don't load the venv if we're just stopping a running session.
+if _try_stop_running():
+    sys.exit(0)
+
+# Otherwise we're starting a new session — re-exec into the venv if needed.
 if sys.executable != str(VENV_PYTHON) and VENV_PYTHON.exists():
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
+
+# ----- Phase 2: lightweight imports + open the audio stream NOW ------------
+# Everything heavy (numpy, groq, etc.) is deferred to Phase 3 so audio capture
+# starts as soon as possible after the hotkey fires.
+
+import atexit
+import subprocess
+import threading
+
+import sounddevice as sd
+
+CONFIG_PATH = Path.home() / ".config/dictation/config"
+SAMPLE_RATE = 16000
+CHANNELS = 1
+NOTIFY_APP = "Dictation"
+
+
+def _critical(title, body):
+    subprocess.run(
+        ["notify-send", "-a", NOTIFY_APP, "-u", "critical", "-t", "2500", title, body],
+        check=False,
+    )
+
+
+def _load_env_from_config():
+    if not CONFIG_PATH.exists():
+        _critical("Config missing", f"Create {CONFIG_PATH}")
+        sys.exit(1)
+    for line in CONFIG_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
+def _acquire_lock():
+    """Atomic lock acquisition. If another tap won the race, exit silently."""
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        sys.exit(0)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+
+
+_load_env_from_config()
+if not os.environ.get("GROQ_API_KEY") or os.environ["GROQ_API_KEY"].startswith("PASTE_"):
+    _critical("API key not set", f"Edit {CONFIG_PATH}")
+    sys.exit(1)
+
+_acquire_lock()
+
+# Open the stream — audio capture starts here, in a background callback thread.
+_chunks = []
+_stop_event = threading.Event()
+signal.signal(signal.SIGTERM, lambda *_: _stop_event.set())
+signal.signal(signal.SIGINT, lambda *_: _stop_event.set())
+
+_stream = sd.InputStream(
+    samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+    callback=lambda data, *_: _chunks.append(data.copy()),
+)
+_stream.start()
+
+
+def _shutdown():
+    try:
+        if _stream.active:
+            _stream.stop()
+        _stream.close()
+    except Exception:
+        pass
+    LOCK_PATH.unlink(missing_ok=True)
+
+
+atexit.register(_shutdown)
+
+# Fire user feedback. Both are subprocess.Popen — non-blocking, fire-and-forget.
+subprocess.Popen(
+    ["notify-send", "-a", NOTIFY_APP, "-t", "1500",
+     "Recording…", "Tap shortcut again to stop"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+subprocess.Popen(
+    ["sox", "-n", "-q", "-d", "synth", "0.08", "sine", "880", "vol", "0.3"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+
+
+# ----- Phase 3: heavy imports — these run while audio is capturing ---------
+
 import json
 import shutil
-import signal
-import subprocess
 import tempfile
-import threading
 import time
 import wave
 
 import numpy as np
-import sounddevice as sd
 from groq import Groq
 
 
 # ----- constants -----------------------------------------------------------
 
-LOCK_PATH = Path("/tmp/dictation.lock")
-CONFIG_PATH = Path.home() / ".config/dictation/config"
 SESSIONS_DIR = Path.home() / ".local/share/dictation/sessions"
 SESSIONS_LOG = SESSIONS_DIR / "sessions.jsonl"
 SESSIONS_AUDIO = SESSIONS_DIR / "audio"
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-NOTIFY_APP = "Dictation"
 
 TRANSCRIBE_MODEL = "whisper-large-v3-turbo"
 CLEANUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -74,19 +185,7 @@ TERMINAL_PATTERNS = (
 )
 
 
-# ----- config + feedback ---------------------------------------------------
-
-def load_config():
-    if not CONFIG_PATH.exists():
-        notify("Config missing", f"Create {CONFIG_PATH}", urgency="critical")
-        sys.exit(1)
-    for line in CONFIG_PATH.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip())
-
+# ----- feedback ------------------------------------------------------------
 
 def notify(title, body="", expire_ms=2500, urgency="normal"):
     subprocess.run(
@@ -102,63 +201,7 @@ def beep(freq):
     )
 
 
-# ----- lock file (toggle behavior) -----------------------------------------
-
-def read_lock():
-    """PID in the lock file if alive; else None (and clean stale lock)."""
-    try:
-        pid = int(LOCK_PATH.read_text().strip())
-    except (FileNotFoundError, ValueError):
-        return None
-    try:
-        os.kill(pid, 0)
-        return pid
-    except ProcessLookupError:
-        LOCK_PATH.unlink(missing_ok=True)
-        return None
-    except PermissionError:
-        return pid
-
-
-def acquire_lock():
-    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(str(os.getpid()))
-
-
-def release_lock():
-    LOCK_PATH.unlink(missing_ok=True)
-
-
-# ----- audio capture + processing ------------------------------------------
-
-def record_until_signal():
-    """Record audio until SIGTERM. Return path to a temp WAV file, or None."""
-    chunks = []
-    stop = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
-                        callback=lambda data, *_: chunks.append(data.copy())):
-        stop.wait()
-
-    if not chunks:
-        return None
-
-    audio = np.concatenate(chunks, axis=0)
-    audio = normalize_audio(audio)
-    audio = trim_silence(audio)
-
-    fd, wav_path = tempfile.mkstemp(prefix="dictation-", suffix=".wav")
-    os.close(fd)
-    with wave.open(wav_path, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio.tobytes())
-    return wav_path
-
+# ----- audio processing ----------------------------------------------------
 
 def normalize_audio(audio):
     """99th-percentile peak normalize quiet recordings to ~-3 dBFS. Skip near-silent input."""
@@ -192,17 +235,37 @@ def trim_silence(audio, frame_ms=20, threshold_rms=120, padding_ms=100):
     return audio[start:end]
 
 
+def finalize_audio():
+    """Stop the stream, normalize, trim, write to a temp WAV. Returns path or None."""
+    if _stream.active:
+        _stream.stop()
+    _stream.close()
+    if not _chunks:
+        return None
+    audio = np.concatenate(_chunks, axis=0)
+    audio = normalize_audio(audio)
+    audio = trim_silence(audio)
+    fd, wav_path = tempfile.mkstemp(prefix="dictation-", suffix=".wav")
+    os.close(fd)
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
+    return wav_path
+
+
 # ----- transcription + cleanup --------------------------------------------
 
-_groq = None
+_groq_client = None
 
 
 def groq():
     """Singleton Groq client — reused across transcribe + cleanup."""
-    global _groq
-    if _groq is None:
-        _groq = Groq(api_key=os.environ["GROQ_API_KEY"])
-    return _groq
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    return _groq_client
 
 
 def transcribe(wav_path):
@@ -282,11 +345,10 @@ def type_text(text):
         subprocess.run(["ydotool", "type", "--key-delay=4", "--", text], check=False)
 
 
-# ----- orchestration -------------------------------------------------------
+# ----- session logging -----------------------------------------------------
 
 def save_session(audio_path, raw_text, clean_text):
-    """Move the WAV into ~/.local/share/dictation/sessions/audio/ and append a
-    JSONL row capturing the raw + cleaned transcripts. Returns True on success."""
+    """Move the WAV into the sessions dir and append a JSONL row. True on success."""
     try:
         SESSIONS_AUDIO.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%dT%H%M%S")
@@ -305,13 +367,14 @@ def save_session(audio_path, raw_text, clean_text):
         return False
 
 
-def run_recording_session():
-    acquire_lock()
-    notify("Recording…", "Tap shortcut again to stop", expire_ms=1500)
-    beep(880)
+# ----- main flow: wait for stop, then process ------------------------------
+
+def main():
+    _stop_event.wait()  # blocks until SIGTERM (next hotkey press)
+
     wav_path = None
     try:
-        wav_path = record_until_signal()
+        wav_path = finalize_audio()
         if not wav_path:
             notify("No audio captured", "", urgency="critical")
             return
@@ -336,24 +399,7 @@ def run_recording_session():
     finally:
         if wav_path and os.path.exists(wav_path):
             os.unlink(wav_path)
-        release_lock()
-
-
-def main():
-    load_config()
-    if not os.environ.get("GROQ_API_KEY") or os.environ["GROQ_API_KEY"].startswith("PASTE_"):
-        notify("API key not set", f"Edit {CONFIG_PATH}", urgency="critical")
-        sys.exit(1)
-
-    other = read_lock()
-    if other is not None:
-        try:
-            os.kill(other, signal.SIGTERM)
-        except ProcessLookupError:
-            LOCK_PATH.unlink(missing_ok=True)
-        return
-
-    run_recording_session()
+        # _shutdown (atexit) closes the stream and releases the lock
 
 
 if __name__ == "__main__":
