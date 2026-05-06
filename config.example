@@ -1,3 +1,8 @@
 # Copy to ~/.config/dictation/config and set chmod 600.
 # Get a key from https://console.groq.com/keys
 GROQ_API_KEY=gsk_your_key_here
+
+# Optional: AI cleanup pass via Groq llama-3.3-70b — removes filler words
+# ("um", "uh", "like"), keeps the final form of self-corrections. Adds
+# roughly 100-300ms of latency. Set to false to disable.
+AI_CLEANUP=true
