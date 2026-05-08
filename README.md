@@ -1,6 +1,6 @@
 # agent-murmur
 
-Push-to-talk dictation for Linux. Powered by Groq's Whisper API.
+Push-to-talk dictation for Linux. OpenAI `gpt-4o-transcribe` for the transcript, Groq Llama 4 Scout for the cleanup pass.
 
 ## Features
 
@@ -23,7 +23,9 @@ cd agent-murmur
 
 After install:
 
-1. **Add your Groq API key** to `~/.config/dictation/config` — get one at [console.groq.com/keys](https://console.groq.com/keys)
+1. **Add your API keys** to `~/.config/dictation/config`:
+   - `OPENAI_API_KEY` from [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+   - `GROQ_API_KEY` from [console.groq.com/keys](https://console.groq.com/keys)
 2. **Log out and log back in** — required for `input` group membership and the `ydotoold` user service
 3. **Bind a KDE global shortcut** to `~/bin/dictation` — System Settings → Shortcuts → Custom Shortcuts → Edit → New → Global Shortcut → Command/URL. Use a single non-modifier key (Insert, F8, Pause); avoid Ctrl/Alt combos.
 

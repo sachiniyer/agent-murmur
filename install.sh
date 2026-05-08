@@ -35,8 +35,8 @@ systemctl --user enable ydotoold.service || true
 say "Creating Python venv and installing dependencies"
 mkdir -p "$(dirname "$VENV_DIR")"
 python3 -m venv "$VENV_DIR"
-"$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install groq sounddevice numpy scipy
+"$VENV_DIR/bin/python3" -m pip install --upgrade pip
+"$VENV_DIR/bin/python3" -m pip install groq openai sounddevice numpy scipy
 
 say "Installing dictation script to $BIN_DIR"
 mkdir -p "$BIN_DIR"
@@ -58,9 +58,10 @@ cat <<EOF
 │                                                                      │
 │  Next steps:                                                         │
 │                                                                      │
-│  1. Add your Groq API key to:                                        │
+│  1. Add your API keys to:                                            │
 │       $CONFIG_DIR/config                                             │
-│     Get a key at: https://console.groq.com/keys                      │
+│       OPENAI_API_KEY  → https://platform.openai.com/api-keys         │
+│       GROQ_API_KEY    → https://console.groq.com/keys                │
 │                                                                      │
 │  2. Log out and log back in. (Required so:                           │
 │       - your session picks up the new 'input' group membership       │

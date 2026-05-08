@@ -90,9 +90,11 @@ def _acquire_lock():
 
 
 _load_env_from_config()
-if not os.environ.get("GROQ_API_KEY") or os.environ["GROQ_API_KEY"].startswith("PASTE_"):
-    _critical("API key not set", f"Edit {CONFIG_PATH}")
-    sys.exit(1)
+for _required in ("OPENAI_API_KEY", "GROQ_API_KEY"):
+    val = os.environ.get(_required, "")
+    if not val or val.startswith("PASTE_") or val.endswith("_here"):
+        _critical(f"{_required} not set", f"Edit {CONFIG_PATH}")
+        sys.exit(1)
 
 _acquire_lock()
 
@@ -143,6 +145,7 @@ import wave
 
 import numpy as np
 from groq import Groq
+from openai import OpenAI
 
 
 # ----- constants -----------------------------------------------------------
@@ -151,8 +154,8 @@ SESSIONS_DIR = Path.home() / ".local/share/dictation/sessions"
 SESSIONS_LOG = SESSIONS_DIR / "sessions.jsonl"
 SESSIONS_AUDIO = SESSIONS_DIR / "audio"
 
-TRANSCRIBE_MODEL = "whisper-large-v3-turbo"
-CLEANUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+TRANSCRIBE_MODEL = "gpt-4o-transcribe"  # OpenAI — best WER as of 2026
+CLEANUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"  # Groq
 
 CLEANUP_SYSTEM_PROMPT = (
     "Clean a dictation transcript: remove fillers (um, uh, like, you know, I mean), "
@@ -255,13 +258,22 @@ def finalize_audio():
     return wav_path
 
 
-# ----- transcription + cleanup --------------------------------------------
+# ----- transcription (OpenAI) + cleanup (Groq) ----------------------------
 
+_openai_client = None
 _groq_client = None
 
 
-def groq():
-    """Singleton Groq client — reused across transcribe + cleanup."""
+def openai_client():
+    """Singleton OpenAI client — used for transcription via gpt-4o-transcribe."""
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _openai_client
+
+
+def groq_client():
+    """Singleton Groq client — used for the cleanup chat-completion pass."""
     global _groq_client
     if _groq_client is None:
         _groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -270,7 +282,7 @@ def groq():
 
 def transcribe(wav_path):
     with open(wav_path, "rb") as f:
-        result = groq().audio.transcriptions.create(
+        result = openai_client().audio.transcriptions.create(
             file=(os.path.basename(wav_path), f, "audio/wav"),
             model=TRANSCRIBE_MODEL,
             language="en",
@@ -290,7 +302,7 @@ def clean_transcript(text):
     messages.append({"role": "user", "content": text})
 
     try:
-        response = groq().chat.completions.create(
+        response = groq_client().chat.completions.create(
             model=CLEANUP_MODEL, messages=messages,
             temperature=0.0, max_tokens=2000,
         )
