@@ -55,7 +55,6 @@ import threading
 import sounddevice as sd
 
 CONFIG_PATH = Path.home() / ".config/dictation/config"
-VOCABULARY_PATH = Path.home() / ".config/dictation/vocabulary"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 NOTIFY_APP = "Dictation"
@@ -155,10 +154,6 @@ SESSIONS_AUDIO = SESSIONS_DIR / "audio"
 
 TRANSCRIBE_MODEL = "scribe_v2"  # ElevenLabs
 
-# ElevenLabs Scribe keyterms API limits.
-KEYTERMS_MAX_COUNT = 50
-KEYTERMS_MAX_LENGTH = 20
-
 TERMINAL_PATTERNS = (
     "wave", "konsole", "alacritty", "kitty", "ghostty",
     "xterm", "wezterm", "gnome-terminal", "tilix", "foot",
@@ -232,34 +227,15 @@ def client():
     return _client
 
 
-def load_keyterms():
-    """Personal vocabulary biasing for transcription. Edit ~/.config/dictation/vocabulary
-    (one term per line, # comments allowed). Returns list of up to 50 terms or None."""
-    if not VOCABULARY_PATH.exists():
-        return None
-    seen = []
-    for line in VOCABULARY_PATH.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        term = line[:KEYTERMS_MAX_LENGTH]
-        if term not in seen:
-            seen.append(term)
-    return seen[:KEYTERMS_MAX_COUNT] or None
-
-
 def transcribe(wav_path):
     """Scribe v2 with no_verbatim=true: filler removal happens server-side."""
-    kwargs = dict(
-        model_id=TRANSCRIBE_MODEL,
-        language_code="en",
-        no_verbatim=True,
-    )
-    keyterms = load_keyterms()
-    if keyterms:
-        kwargs["keyterms"] = keyterms
     with open(wav_path, "rb") as f:
-        result = client().speech_to_text.convert(file=f, **kwargs)
+        result = client().speech_to_text.convert(
+            file=f,
+            model_id=TRANSCRIBE_MODEL,
+            language_code="en",
+            no_verbatim=True,
+        )
     return (result.text or "").strip()
 
 
