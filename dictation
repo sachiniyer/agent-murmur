@@ -55,21 +55,29 @@ import threading
 import sounddevice as sd
 
 CONFIG_PATH = Path.home() / ".config/dictation/config"
+VOCABULARY_PATH = Path.home() / ".config/dictation/vocabulary"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 NOTIFY_APP = "Dictation"
 
 
-def _critical(title, body):
-    subprocess.run(
-        ["notify-send", "-a", NOTIFY_APP, "-u", "critical", "-t", "2500", title, body],
-        check=False,
+def notify(title, body="", expire_ms=2500, urgency="normal"):
+    subprocess.Popen(
+        ["notify-send", "-a", NOTIFY_APP, "-u", urgency, "-t", str(expire_ms), title, body],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def beep(freq):
+    subprocess.Popen(
+        ["sox", "-n", "-q", "-d", "synth", "0.08", "sine", str(freq), "vol", "0.3"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
 def _load_env_from_config():
     if not CONFIG_PATH.exists():
-        _critical("Config missing", f"Create {CONFIG_PATH}")
+        notify("Config missing", f"Create {CONFIG_PATH}", urgency="critical")
         sys.exit(1)
     for line in CONFIG_PATH.read_text().splitlines():
         line = line.strip()
@@ -90,9 +98,9 @@ def _acquire_lock():
 
 
 _load_env_from_config()
-val = os.environ.get("ELEVENLABS_API_KEY", "")
-if not val or val.startswith("PASTE_") or val.endswith("_here"):
-    _critical("ELEVENLABS_API_KEY not set", f"Edit {CONFIG_PATH}")
+_key = os.environ.get("ELEVENLABS_API_KEY", "")
+if not _key or _key.startswith("PASTE_") or _key.endswith("_here"):
+    notify("ELEVENLABS_API_KEY not set", f"Edit {CONFIG_PATH}", urgency="critical")
     sys.exit(1)
 
 _acquire_lock()
@@ -122,16 +130,9 @@ def _shutdown():
 
 atexit.register(_shutdown)
 
-# Fire user feedback. Both are subprocess.Popen — non-blocking, fire-and-forget.
-subprocess.Popen(
-    ["notify-send", "-a", NOTIFY_APP, "-t", "1500",
-     "Recording…", "Tap shortcut again to stop"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-)
-subprocess.Popen(
-    ["sox", "-n", "-q", "-d", "synth", "0.08", "sine", "880", "vol", "0.3"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-)
+# Fire user feedback (non-blocking).
+notify("Recording…", "Tap shortcut again to stop", expire_ms=1500)
+beep(880)
 
 
 # ----- Phase 3: heavy imports — these run while audio is capturing ---------
@@ -154,26 +155,14 @@ SESSIONS_AUDIO = SESSIONS_DIR / "audio"
 
 TRANSCRIBE_MODEL = "scribe_v2"  # ElevenLabs
 
+# ElevenLabs Scribe keyterms API limits.
+KEYTERMS_MAX_COUNT = 50
+KEYTERMS_MAX_LENGTH = 20
+
 TERMINAL_PATTERNS = (
     "wave", "konsole", "alacritty", "kitty", "ghostty",
     "xterm", "wezterm", "gnome-terminal", "tilix", "foot",
 )
-
-
-# ----- feedback ------------------------------------------------------------
-
-def notify(title, body="", expire_ms=2500, urgency="normal"):
-    subprocess.run(
-        ["notify-send", "-a", NOTIFY_APP, "-u", urgency, "-t", str(expire_ms), title, body],
-        check=False,
-    )
-
-
-def beep(freq):
-    subprocess.Popen(
-        ["sox", "-n", "-q", "-d", "synth", "0.08", "sine", str(freq), "vol", "0.3"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
 
 
 # ----- audio processing ----------------------------------------------------
@@ -243,15 +232,34 @@ def client():
     return _client
 
 
+def load_keyterms():
+    """Personal vocabulary biasing for transcription. Edit ~/.config/dictation/vocabulary
+    (one term per line, # comments allowed). Returns list of up to 50 terms or None."""
+    if not VOCABULARY_PATH.exists():
+        return None
+    seen = []
+    for line in VOCABULARY_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        term = line[:KEYTERMS_MAX_LENGTH]
+        if term not in seen:
+            seen.append(term)
+    return seen[:KEYTERMS_MAX_COUNT] or None
+
+
 def transcribe(wav_path):
     """Scribe v2 with no_verbatim=true: filler removal happens server-side."""
+    kwargs = dict(
+        model_id=TRANSCRIBE_MODEL,
+        language_code="en",
+        no_verbatim=True,
+    )
+    keyterms = load_keyterms()
+    if keyterms:
+        kwargs["keyterms"] = keyterms
     with open(wav_path, "rb") as f:
-        result = client().speech_to_text.convert(
-            file=f,
-            model_id=TRANSCRIBE_MODEL,
-            language_code="en",
-            no_verbatim=True,
-        )
+        result = client().speech_to_text.convert(file=f, **kwargs)
     return (result.text or "").strip()
 
 
