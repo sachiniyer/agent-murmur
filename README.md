@@ -1,14 +1,14 @@
 # agent-murmur
 
-Push-to-talk dictation for Linux. OpenAI `gpt-4o-transcribe` for the transcript, Groq Llama 4 Scout for the cleanup pass.
+Push-to-talk dictation for Linux. Powered by ElevenLabs Scribe v2 (best-in-class WER + built-in disfluency removal).
 
 ## Features
 
 - **Toggle hotkey** — tap to start, tap again to stop
-- **Audio normalization + silence trim** — boosts quiet recordings (whispers) to Whisper's expected level and strips leading/trailing silence
-- **AI cleanup pass** — Llama 4 Scout removes filler words and self-corrections after Whisper transcribes
+- **Audio normalization + silence trim** — boosts quiet recordings (whispers) to a usable level and strips leading/trailing silence
+- **Filler removal** — Scribe v2's `no_verbatim=true` strips "um", "uh", and false starts as part of transcription (no separate cleanup pass)
 - **Per-window typing** — `xdotool` for Wave Terminal, `wl-copy` + Ctrl+Shift+V for other terminals, `ydotool` everywhere else
-- **Session logging** — every transcript pair (raw + cleaned) plus the audio is saved to `~/.local/share/dictation/sessions/` for later analysis
+- **Session logging** — every transcript and the audio is saved to `~/.local/share/dictation/sessions/` for later analysis
 - **Notifications + audio cues** on start/stop
 
 ## Install
@@ -23,9 +23,7 @@ cd agent-murmur
 
 After install:
 
-1. **Add your API keys** to `~/.config/dictation/config`:
-   - `OPENAI_API_KEY` from [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
-   - `GROQ_API_KEY` from [console.groq.com/keys](https://console.groq.com/keys)
+1. **Add your ElevenLabs API key** to `~/.config/dictation/config` — get one at [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)
 2. **Log out and log back in** — required for `input` group membership and the `ydotoold` user service
 3. **Bind a KDE global shortcut** to `~/bin/dictation` — System Settings → Shortcuts → Custom Shortcuts → Edit → New → Global Shortcut → Command/URL. Use a single non-modifier key (Insert, F8, Pause); avoid Ctrl/Alt combos.
 
